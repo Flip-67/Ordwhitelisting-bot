@@ -1,0 +1,306 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import os
+import logging
+import csv
+import io
+import json
+
+# Enable logging for debugging
+logging.basicConfig(level=logging.INFO)  # Changed to INFO to reduce verbosity
+
+# Intents for the bot
+intents = discord.Intents.default()
+intents.messages = True
+intents.guilds = True
+intents.members = True
+intents.message_content = True
+
+# Bot setup
+TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+if not TOKEN:
+    print("Error: DISCORD_BOT_TOKEN is not set in environment variables.")
+    exit(1)
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+# Persistent data storage
+SETTINGS_FILE = 'settings.json'
+
+def load_settings():
+    global whitelist_channel_id, auto_role_id, submitted_wallets, whitelist_status, max_wallets, delete_on_leave
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, 'r') as f:
+            data = json.load(f)
+            whitelist_channel_id = data.get('whitelist_channel_id')
+            auto_role_id = data.get('auto_role_id')
+            submitted_wallets = {int(k): v for k, v in data.get('submitted_wallets', {}).items()}
+            whitelist_status = data.get('whitelist_status', True)
+            max_wallets = data.get('max_wallets', 1)
+            delete_on_leave = data.get('delete_on_leave', False)
+    else:
+        # Initialize default settings
+        whitelist_channel_id = None
+        auto_role_id = None
+        submitted_wallets = {}
+        whitelist_status = True
+        max_wallets = 1
+        delete_on_leave = False
+        save_settings()
+
+def save_settings():
+    data = {
+        'whitelist_channel_id': whitelist_channel_id,
+        'auto_role_id': auto_role_id,
+        'submitted_wallets': submitted_wallets,
+        'whitelist_status': whitelist_status,
+        'max_wallets': max_wallets,
+        'delete_on_leave': delete_on_leave
+    }
+    with open(SETTINGS_FILE, 'w') as f:
+        json.dump(data, f, indent=4)
+
+# Load settings on startup
+load_settings()
+
+# === PERSISTENT VIEW REGISTRATION ===
+class SubmitWalletButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Submit Wallet", style=discord.ButtonStyle.primary, custom_id="submit_wallet")
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(SubmitWalletModal())
+
+class PersistentView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(SubmitWalletButton())
+
+# Modal for entering wallet
+class SubmitWalletModal(discord.ui.Modal, title="Submit Your Wallet"):
+    wallet_address = discord.ui.TextInput(label="Wallet Address", required=True)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        global submitted_wallets
+        user = interaction.user
+        if not whitelist_status:
+            await interaction.response.send_message("Whitelisting is currently disabled.", ephemeral=True)
+            return
+        if user.id not in submitted_wallets:
+            submitted_wallets[user.id] = []
+        if len(submitted_wallets[user.id]) >= max_wallets:
+            await interaction.response.send_message(f"Max wallets reached ({max_wallets}).", ephemeral=True)
+            return
+        submitted_wallets[user.id].append(self.wallet_address.value)
+        save_settings()  # Save after submission
+        await interaction.response.send_message("Wallet submitted successfully!", ephemeral=True)
+        # Assign Role if auto_role_id:
+        if auto_role_id:
+            guild = interaction.guild
+            role = guild.get_role(auto_role_id)
+            if role:
+                await user.add_roles(role)
+                await interaction.followup.send(f"You have been given the **{role.name}** role!", ephemeral=True)
+
+@bot.event
+async def on_ready():
+    logging.info(f'Logged in as {bot.user}')
+    print(f'Logged in as {bot.user}')
+    # Sync slash commands properly
+    try:
+        await bot.tree.sync()
+        print("✅ Slash commands synced globally.")
+    except Exception as e:
+        logging.error(f"❌ Failed to sync commands: {e}")
+    bot.add_view(PersistentView())  # Ensuring view persistence
+    print("✅ UI components registered.")
+    # Post the wallet submission button if a whitelist channel is set and whitelist is active
+    await post_whitelist_message()
+
+async def post_whitelist_message():
+    """ Sends the whitelist submission button in the correct channel """
+    if whitelist_channel_id and whitelist_status:
+        channel = bot.get_channel(whitelist_channel_id)
+        if channel:
+            # Avoid spamming the channel by checking existing messages
+            async for message in channel.history(limit=100):
+                if message.author == bot.user:
+                    return  # Assume the message is already posted
+            await channel.send("Click the button below to submit your wallet:", view=PersistentView())
+
+# === SLASH COMMANDS ===
+
+# Slash command to download wallets
+@tree.command(name="download_wallets", description="Download all submitted wallets (Admin Only)")
+@app_commands.default_permissions(administrator=True)
+async def download_wallets(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+        return
+    if not submitted_wallets:
+        await interaction.response.send_message("No wallets have been submitted yet.", ephemeral=True)
+        return
+    # Create CSV data
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["User ID", "Username", "Wallet Addresses"])
+    for user_id, wallets in submitted_wallets.items():
+        user = interaction.guild.get_member(user_id)
+        username = user.name if user else "Unknown User"
+        writer.writerow([user_id, username, ", ".join(wallets)])
+    output.seek(0)
+    file = discord.File(io.BytesIO(output.getvalue().encode()), filename="submitted_wallets.csv")
+    await interaction.response.send_message("Here is the wallet submission file:", file=file, ephemeral=True)
+
+# Slash command to configure settings
+@tree.command(name="configure", description="Configure whitelist settings")
+@app_commands.default_permissions(administrator=True)
+async def configure(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+        return
+    await interaction.response.send_message("Select a setting to configure:", view=ConfigureDropdown(interaction.guild), ephemeral=True)
+
+class ConfigureDropdown(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=None)
+        self.add_item(SettingDropdown(guild))
+
+class SettingDropdown(discord.ui.Select):
+    def __init__(self, guild):
+        options = [
+            discord.SelectOption(label="Set Channel", value="channel"),
+            discord.SelectOption(label="Set Auto-Role", value="role"),
+            discord.SelectOption(label="Toggle Whitelist Status", value="status"),
+            discord.SelectOption(label="Set Max Wallets", value="maxwallets"),
+            discord.SelectOption(label="Toggle Delete on Leave", value="deleteonleave"),
+            discord.SelectOption(label="Reset Settings", value="reset"),
+        ]
+        super().__init__(placeholder="Select a setting to configure...", min_values=1, max_values=1, options=options)
+        self.guild = guild
+
+    async def callback(self, interaction: discord.Interaction):
+        selected = self.values[0]
+        if selected == "channel":
+            await interaction.response.send_message(view=SelectChannelDropdown(interaction.guild), ephemeral=True)
+        elif selected == "role":
+            await interaction.response.send_message(view=SelectRoleDropdown(interaction.guild), ephemeral=True)
+        elif selected == "maxwallets":
+            await interaction.response.send_message(view=SelectWalletLimitDropdown(), ephemeral=True)
+        elif selected == "status":
+            await toggle_status(interaction)
+        elif selected == "deleteonleave":
+            await toggle_delete_on_leave(interaction)
+        elif selected == "reset":
+            await reset_settings(interaction)
+        else:
+            await interaction.response.send_message("Invalid selection.", ephemeral=True)
+
+# Toggle Whitelist Status
+async def toggle_status(interaction: discord.Interaction):
+    global whitelist_status
+    whitelist_status = not whitelist_status
+    save_settings()
+    status = "enabled" if whitelist_status else "disabled"
+    await interaction.response.send_message(f"Whitelist status has been **{status}**.", ephemeral=True)
+    if whitelist_status:
+        await post_whitelist_message()
+    else:
+        # Optionally, you can remove the submission message or notify users
+        pass
+
+# Toggle Delete on Leave
+async def toggle_delete_on_leave(interaction: discord.Interaction):
+    global delete_on_leave
+    delete_on_leave = not delete_on_leave
+    save_settings()
+    status = "enabled" if delete_on_leave else "disabled"
+    await interaction.response.send_message(f"Delete on leave has been **{status}**.", ephemeral=True)
+
+# Reset Settings
+async def reset_settings(interaction: discord.Interaction):
+    global whitelist_channel_id, auto_role_id, submitted_wallets, whitelist_status, max_wallets, delete_on_leave
+    whitelist_channel_id = None
+    auto_role_id = None
+    submitted_wallets = {}
+    whitelist_status = True
+    max_wallets = 1
+    delete_on_leave = False
+    save_settings()
+    await interaction.response.send_message("All settings have been reset to default.", ephemeral=True)
+    # Optionally, remove existing views or notify users
+    # You might want to repost the whitelist message if enabled
+    await post_whitelist_message()
+
+# View and Dropdown for selecting channel
+class SelectChannelDropdown(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=None)
+        self.add_item(ChannelDropdown(guild))
+
+class ChannelDropdown(discord.ui.Select):
+    def __init__(self, guild):
+        options = [discord.SelectOption(label=channel.name, value=str(channel.id)) for channel in guild.text_channels]
+        super().__init__(placeholder="Select a channel...", min_values=1, max_values=1, options=options)
+        self.guild = guild
+
+    async def callback(self, interaction: discord.Interaction):
+        global whitelist_channel_id
+        whitelist_channel_id = int(self.values[0])
+        save_settings()
+        selected_channel = self.guild.get_channel(whitelist_channel_id)
+        await interaction.response.send_message(f"Whitelist channel set to {selected_channel.mention}.", ephemeral=True)
+        # Post the whitelist message in the newly selected channel
+        await post_whitelist_message()
+
+# View and Dropdown for selecting role
+class SelectRoleDropdown(discord.ui.View):
+    def __init__(self, guild):
+        super().__init__(timeout=None)
+        self.add_item(RoleDropdown(guild))
+
+class RoleDropdown(discord.ui.Select):
+    def __init__(self, guild):
+        options = [discord.SelectOption(label=role.name, value=str(role.id)) for role in guild.roles if not role.is_bot_managed()]
+        super().__init__(placeholder="Select a role...", min_values=1, max_values=1, options=options)
+        self.guild = guild
+
+    async def callback(self, interaction: discord.Interaction):
+        global auto_role_id
+        auto_role_id = int(self.values[0])
+        save_settings()
+        selected_role = self.guild.get_role(auto_role_id)
+        await interaction.response.send_message(f"Auto role set to {selected_role.mention}.", ephemeral=True)
+
+# View and Dropdown for selecting wallet limit
+class SelectWalletLimitDropdown(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(WalletLimitDropdown())
+
+class WalletLimitDropdown(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label=str(i), value=str(i)) for i in range(1, 26)]
+        super().__init__(placeholder="Select max wallets per user...", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        global max_wallets
+        max_wallets = int(self.values[0])
+        save_settings()
+        await interaction.response.send_message(f"Max wallets per user set to {max_wallets}.", ephemeral=True)
+
+# Handling members leaving if delete_on_leave is enabled
+@bot.event
+async def on_member_remove(member):
+    if delete_on_leave:
+        if member.id in submitted_wallets:
+            del submitted_wallets[member.id]
+            save_settings()
+            logging.info(f"Deleted wallets for {member.name} ({member.id}) due to leaving the server.")
+
+# Ensure the bot runs
+if __name__ == "__main__":
+    bot.run(TOKEN)
+
