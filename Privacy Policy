@@ -1,0 +1,17 @@
+Privacy Policy
+1. Data Collection
+The bot collects and stores Discord user IDs and submitted BTC wallet addresses.
+Audit logs are kept for administrative tracking.
+2. How Data is Used
+Data is used solely for whitelist management within Discord servers.
+Wallet addresses are only stored for validation and verification purposes.
+3. Data Sharing
+User data is never sold or shared with third parties.
+Server administrators may access collected data to manage whitelist submissions.
+4. Data Retention & Removal
+Wallet data and logs are stored as long as required for whitelist management.
+Users may request removal of their submitted wallets by contacting a server administrator.
+5. Security Measures
+Reasonable measures are taken to protect stored data.
+Users should not share sensitive personal information through the bot.
+For any questions regarding these terms, contact the bot developer.
